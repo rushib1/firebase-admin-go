@@ -62,7 +62,11 @@ func newTokenGenerator(ctx context.Context, conf *internal.AuthConfig) (*tokenGe
 	}, nil
 }
 
-func (tg *tokenGenerator) Token(ctx context.Context, uid string, claims map[string]interface{}) (string, error) {
+func (tg *tokenGenerator) Token(
+	ctx context.Context,
+	uid string,
+	claims map[string]interface{}) (string, error) {
+
 	iss, err := tg.signer.Email(ctx)
 	if err != nil {
 		return "", err
@@ -100,11 +104,6 @@ func (tg *tokenGenerator) Token(ctx context.Context, uid string, claims map[stri
 	return jwt.Token(ctx, tg.signer)
 }
 
-type jwtInfo struct {
-	header  jwtHeader
-	payload interface{}
-}
-
 type jwtHeader struct {
 	Algorithm string `json:"alg"`
 	Type      string `json:"typ"`
@@ -119,6 +118,11 @@ type customToken struct {
 	Sub    string                 `json:"sub,omitempty"`
 	UID    string                 `json:"uid,omitempty"`
 	Claims map[string]interface{} `json:"claims,omitempty"`
+}
+
+type jwtInfo struct {
+	header  jwtHeader
+	payload interface{}
 }
 
 // Token encodes the data in the jwtInfo into a signed JSON web token.
@@ -176,6 +180,12 @@ func newSigner(ctx context.Context, conf *internal.AuthConfig) (cryptoSigner, er
 	return newCryptoSigner(ctx, conf)
 }
 
+// serviceAccountSigner is a cryptoSigner that signs data using service account credentials.
+type serviceAccountSigner struct {
+	privateKey  *rsa.PrivateKey
+	clientEmail string
+}
+
 var errNotAServiceAcct = errors.New("credentials json is not a service account")
 
 func newServiceAccountSigner(b []byte) (*serviceAccountSigner, error) {
@@ -214,27 +224,6 @@ func newServiceAccountSigner(b []byte) (*serviceAccountSigner, error) {
 	}, nil
 }
 
-func newIAMSigner(ctx context.Context, serviceAcct string, opts ...option.ClientOption) (*iamSigner, error) {
-	hc, _, err := transport.NewHTTPClient(ctx, opts...)
-	if err != nil {
-		return nil, err
-	}
-
-	return &iamSigner{
-		mutex:        &sync.Mutex{},
-		httpClient:   &internal.HTTPClient{Client: hc},
-		serviceAcct:  serviceAcct,
-		metadataHost: "http://metadata",
-		iamHost:      "https://iam.googleapis.com",
-	}, nil
-}
-
-// serviceAccountSigner is a cryptoSigner that signs data using service account credentials.
-type serviceAccountSigner struct {
-	privateKey  *rsa.PrivateKey
-	clientEmail string
-}
-
 func (s serviceAccountSigner) Sign(ctx context.Context, b []byte) ([]byte, error) {
 	hash := sha256.New()
 	hash.Write(b)
@@ -258,6 +247,25 @@ type iamSigner struct {
 	serviceAcct  string
 	metadataHost string
 	iamHost      string
+}
+
+func newIAMSigner(
+	ctx context.Context,
+	serviceAcct string,
+	opts ...option.ClientOption) (*iamSigner, error) {
+
+	hc, _, err := transport.NewHTTPClient(ctx, opts...)
+	if err != nil {
+		return nil, err
+	}
+
+	return &iamSigner{
+		mutex:        &sync.Mutex{},
+		httpClient:   &internal.HTTPClient{Client: hc},
+		serviceAcct:  serviceAcct,
+		metadataHost: "http://metadata",
+		iamHost:      "https://iam.googleapis.com",
+	}, nil
 }
 
 func (s iamSigner) Sign(ctx context.Context, b []byte) ([]byte, error) {
