@@ -32,6 +32,7 @@ func TestNewIDTokenVerifier(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	if tv.shortName != "ID token" {
 		t.Errorf("tokenVerifier.shortName = %q; want = %q", tv.shortName, "ID token")
 	}
@@ -41,6 +42,7 @@ func TestNewIDTokenVerifier(t *testing.T) {
 	if tv.issuerPrefix != idTokenIssuerPrefix {
 		t.Errorf("tokenVerifier.issuerPrefix = %q; want = %q", tv.issuerPrefix, idTokenIssuerPrefix)
 	}
+
 	ks, ok := tv.keySource.(*httpKeySource)
 	if !ok {
 		t.Fatalf("tokenVerifier.keySource = %#v; want = httpKeySource", tv.keySource)

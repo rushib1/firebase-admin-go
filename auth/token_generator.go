@@ -31,8 +31,79 @@ import (
 	"sync"
 
 	"firebase.google.com/go/internal"
+	"google.golang.org/api/option"
 	"google.golang.org/api/transport"
 )
+
+const (
+	firebaseAudience = "https://identitytoolkit.googleapis.com/google.identity.identitytoolkit.v1.IdentityToolkit"
+	oneHourInSeconds = 3600
+)
+
+var reservedClaims = []string{
+	"acr", "amr", "at_hash", "aud", "auth_time", "azp", "cnf", "c_hash",
+	"exp", "firebase", "iat", "iss", "jti", "nbf", "nonce", "sub",
+}
+
+type tokenGenerator struct {
+	clock  internal.Clock
+	signer cryptoSigner
+}
+
+func newTokenGenerator(ctx context.Context, conf *internal.AuthConfig) (*tokenGenerator, error) {
+	signer, err := newSigner(ctx, conf)
+	if err != nil {
+		return nil, err
+	}
+
+	return &tokenGenerator{
+		clock:  internal.SystemClock,
+		signer: signer,
+	}, nil
+}
+
+func (tg *tokenGenerator) Token(ctx context.Context, uid string, claims map[string]interface{}) (string, error) {
+	iss, err := tg.signer.Email(ctx)
+	if err != nil {
+		return "", err
+	}
+
+	if len(uid) == 0 || len(uid) > 128 {
+		return "", errors.New("uid must be non-empty, and not longer than 128 characters")
+	}
+
+	var disallowed []string
+	for _, k := range reservedClaims {
+		if _, contains := claims[k]; contains {
+			disallowed = append(disallowed, k)
+		}
+	}
+	if len(disallowed) == 1 {
+		return "", fmt.Errorf("developer claim %q is reserved and cannot be specified", disallowed[0])
+	} else if len(disallowed) > 1 {
+		return "", fmt.Errorf("developer claims %q are reserved and cannot be specified", strings.Join(disallowed, ", "))
+	}
+
+	now := tg.clock.Now().Unix()
+	jwt := &jwtInfo{
+		header: jwtHeader{Algorithm: "RS256", Type: "JWT"},
+		payload: &customToken{
+			Iss:    iss,
+			Sub:    iss,
+			Aud:    firebaseAudience,
+			UID:    uid,
+			Iat:    now,
+			Exp:    now + oneHourInSeconds,
+			Claims: claims,
+		},
+	}
+	return jwt.Token(ctx, tg.signer)
+}
+
+type jwtInfo struct {
+	header  jwtHeader
+	payload interface{}
+}
 
 type jwtHeader struct {
 	Algorithm string `json:"alg"`
@@ -48,11 +119,6 @@ type customToken struct {
 	Sub    string                 `json:"sub,omitempty"`
 	UID    string                 `json:"uid,omitempty"`
 	Claims map[string]interface{} `json:"claims,omitempty"`
-}
-
-type jwtInfo struct {
-	header  jwtHeader
-	payload interface{}
 }
 
 // Token encodes the data in the jwtInfo into a signed JSON web token.
@@ -81,37 +147,50 @@ func (info *jwtInfo) Token(ctx context.Context, signer cryptoSigner) (string, er
 	return fmt.Sprintf("%s.%s", tokenData, base64.RawURLEncoding.EncodeToString(sig)), nil
 }
 
-type serviceAccount struct {
-	PrivateKey  string `json:"private_key"`
-	ClientEmail string `json:"client_email"`
-}
-
 // cryptoSigner is used to cryptographically sign data, and query the identity of the signer.
 type cryptoSigner interface {
 	Sign(context.Context, []byte) ([]byte, error)
 	Email(context.Context) (string, error)
 }
 
-// serviceAccountSigner is a cryptoSigner that signs data using service account credentials.
-type serviceAccountSigner struct {
-	privateKey  *rsa.PrivateKey
-	clientEmail string
+func newSigner(ctx context.Context, conf *internal.AuthConfig) (cryptoSigner, error) {
+	if conf.Creds != nil && len(conf.Creds.JSON) > 0 {
+		// If the SDK was initialized with a service account, use it to sign bytes.
+		signer, err := newServiceAccountSigner(conf.Creds.JSON)
+		if err != nil && err != errNotAServiceAcct {
+			return nil, err
+		}
+		if signer != nil {
+			return signer, nil
+		}
+	}
+
+	if conf.ServiceAccountID != "" {
+		// If the SDK was initialized with a service account email, use it with the IAM service
+		// to sign bytes.
+		return newIAMSigner(ctx, conf.ServiceAccountID, conf.Opts...)
+	}
+
+	// Use GAE signing capabilities if available. Otherwise, obtain a service account email
+	// from the local Metadata service, and fallback to the IAM service.
+	return newCryptoSigner(ctx, conf)
 }
 
 var errNotAServiceAcct = errors.New("credentials json is not a service account")
 
-func signerFromCreds(creds []byte) (cryptoSigner, error) {
-	var sa serviceAccount
-	if err := json.Unmarshal(creds, &sa); err != nil {
+func newServiceAccountSigner(b []byte) (*serviceAccountSigner, error) {
+	var sa struct {
+		PrivateKey  string `json:"private_key"`
+		ClientEmail string `json:"client_email"`
+	}
+	if err := json.Unmarshal(b, &sa); err != nil {
 		return nil, err
 	}
-	if sa.PrivateKey != "" && sa.ClientEmail != "" {
-		return newServiceAccountSigner(sa)
-	}
-	return nil, errNotAServiceAcct
-}
 
-func newServiceAccountSigner(sa serviceAccount) (*serviceAccountSigner, error) {
+	if sa.PrivateKey == "" && sa.ClientEmail == "" {
+		return nil, errNotAServiceAcct
+	}
+
 	block, _ := pem.Decode([]byte(sa.PrivateKey))
 	if block == nil {
 		return nil, fmt.Errorf("no private key data found in: %q", sa.PrivateKey)
@@ -123,14 +202,37 @@ func newServiceAccountSigner(sa serviceAccount) (*serviceAccountSigner, error) {
 			return nil, fmt.Errorf("private key should be a PEM or plain PKCS1 or PKCS8; parse error: %v", err)
 		}
 	}
+
 	rsaKey, ok := parsedKey.(*rsa.PrivateKey)
 	if !ok {
 		return nil, errors.New("private key is not an RSA key")
 	}
+
 	return &serviceAccountSigner{
 		privateKey:  rsaKey,
 		clientEmail: sa.ClientEmail,
 	}, nil
+}
+
+func newIAMSigner(ctx context.Context, serviceAcct string, opts ...option.ClientOption) (*iamSigner, error) {
+	hc, _, err := transport.NewHTTPClient(ctx, opts...)
+	if err != nil {
+		return nil, err
+	}
+
+	return &iamSigner{
+		mutex:        &sync.Mutex{},
+		httpClient:   &internal.HTTPClient{Client: hc},
+		serviceAcct:  serviceAcct,
+		metadataHost: "http://metadata",
+		iamHost:      "https://iam.googleapis.com",
+	}, nil
+}
+
+// serviceAccountSigner is a cryptoSigner that signs data using service account credentials.
+type serviceAccountSigner struct {
+	privateKey  *rsa.PrivateKey
+	clientEmail string
 }
 
 func (s serviceAccountSigner) Sign(ctx context.Context, b []byte) ([]byte, error) {
@@ -158,25 +260,12 @@ type iamSigner struct {
 	iamHost      string
 }
 
-func newIAMSigner(ctx context.Context, config *internal.AuthConfig) (*iamSigner, error) {
-	hc, _, err := transport.NewHTTPClient(ctx, config.Opts...)
-	if err != nil {
-		return nil, err
-	}
-	return &iamSigner{
-		mutex:        &sync.Mutex{},
-		httpClient:   &internal.HTTPClient{Client: hc},
-		serviceAcct:  config.ServiceAccountID,
-		metadataHost: "http://metadata",
-		iamHost:      "https://iam.googleapis.com",
-	}, nil
-}
-
 func (s iamSigner) Sign(ctx context.Context, b []byte) ([]byte, error) {
 	account, err := s.Email(ctx)
 	if err != nil {
 		return nil, err
 	}
+
 	url := fmt.Sprintf("%s/v1/projects/-/serviceAccounts/%s:signBlob", s.iamHost, account)
 	body := map[string]interface{}{
 		"bytesToSign": base64.StdEncoding.EncodeToString(b),
@@ -189,7 +278,9 @@ func (s iamSigner) Sign(ctx context.Context, b []byte) ([]byte, error) {
 	resp, err := s.httpClient.Do(ctx, req)
 	if err != nil {
 		return nil, err
-	} else if resp.Status == http.StatusOK {
+	}
+
+	if resp.Status == http.StatusOK {
 		var signResponse struct {
 			Signature string `json:"signature"`
 		}
@@ -198,6 +289,7 @@ func (s iamSigner) Sign(ctx context.Context, b []byte) ([]byte, error) {
 		}
 		return base64.StdEncoding.DecodeString(signResponse.Signature)
 	}
+
 	var signError struct {
 		Error struct {
 			Message string `json:"message"`
@@ -205,15 +297,12 @@ func (s iamSigner) Sign(ctx context.Context, b []byte) ([]byte, error) {
 		} `json:"error"`
 	}
 	json.Unmarshal(resp.Body, &signError) // ignore any json parse errors at this level
-	var (
-		clientCode, msg string
-		ok              bool
-	)
-	clientCode, ok = serverError[signError.Error.Status]
+
+	clientCode, ok := serverError[signError.Error.Status]
 	if !ok {
 		clientCode = unknown
 	}
-	msg = signError.Error.Message
+	msg := signError.Error.Message
 	if msg == "" {
 		msg = fmt.Sprintf("client encountered an unknown error; response: %s", string(resp.Body))
 	}
@@ -224,6 +313,7 @@ func (s iamSigner) Email(ctx context.Context) (string, error) {
 	if s.serviceAcct != "" {
 		return s.serviceAcct, nil
 	}
+
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
 	result, err := s.callMetadataService(ctx)

@@ -25,8 +25,6 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
-
-	"firebase.google.com/go/internal"
 )
 
 func TestEncodeToken(t *testing.T) {
@@ -94,17 +92,15 @@ func TestServiceAccountSigner(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	var sa serviceAccount
-	if err := json.Unmarshal(b, &sa); err != nil {
-		t.Fatal(err)
-	}
-	signer, err := newServiceAccountSigner(sa)
+	signer, err := newServiceAccountSigner(b)
 	if err != nil {
 		t.Fatal(err)
 	}
+
+	const wantEmail = "mock-email@mock-project.iam.gserviceaccount.com"
 	email, err := signer.Email(context.Background())
-	if email != sa.ClientEmail || err != nil {
-		t.Errorf("Email() = (%q, %v); want = (%q, nil)", email, err, sa.ClientEmail)
+	if email != wantEmail || err != nil {
+		t.Errorf("Email() = (%q, %v); want = (%q, nil)", email, err, wantEmail)
 	}
 	sign, err := signer.Sign(context.Background(), []byte("test"))
 	if sign == nil || err != nil {
@@ -114,17 +110,13 @@ func TestServiceAccountSigner(t *testing.T) {
 
 func TestIAMSigner(t *testing.T) {
 	ctx := context.Background()
-	conf := &internal.AuthConfig{
-		Opts:             optsWithTokenSource,
-		ServiceAccountID: "test-service-account",
-	}
-	signer, err := newIAMSigner(ctx, conf)
+	signer, err := newIAMSigner(ctx, testServiceAcctID, optsWithTokenSource...)
 	if err != nil {
 		t.Fatal(err)
 	}
 	email, err := signer.Email(ctx)
-	if email != conf.ServiceAccountID || err != nil {
-		t.Errorf("Email() = (%q, %v); want = (%q, nil)", email, err, conf.ServiceAccountID)
+	if email != testServiceAcctID || err != nil {
+		t.Errorf("Email() = (%q, %v); want = (%q, nil)", email, err, testServiceAcctID)
 	}
 
 	wantSignature := "test-signature"
@@ -142,11 +134,7 @@ func TestIAMSigner(t *testing.T) {
 }
 
 func TestIAMSignerHTTPError(t *testing.T) {
-	conf := &internal.AuthConfig{
-		Opts:             optsWithTokenSource,
-		ServiceAccountID: "test-service-account",
-	}
-	signer, err := newIAMSigner(context.Background(), conf)
+	signer, err := newIAMSigner(context.Background(), testServiceAcctID, optsWithTokenSource...)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -169,11 +157,7 @@ func TestIAMSignerHTTPError(t *testing.T) {
 }
 
 func TestIAMSignerUnknownHTTPError(t *testing.T) {
-	conf := &internal.AuthConfig{
-		Opts:             optsWithTokenSource,
-		ServiceAccountID: "test-service-account",
-	}
-	signer, err := newIAMSigner(context.Background(), conf)
+	signer, err := newIAMSigner(context.Background(), testServiceAcctID, optsWithTokenSource...)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -195,13 +179,27 @@ func TestIAMSignerUnknownHTTPError(t *testing.T) {
 	}
 }
 
-func TestIAMSignerWithMetadataService(t *testing.T) {
-	ctx := context.Background()
-	conf := &internal.AuthConfig{
-		Opts: optsWithTokenSource,
+func TestIAMSignerTransportError(t *testing.T) {
+	signer, err := newIAMSigner(context.Background(), testServiceAcctID, optsWithTokenSource...)
+	if err != nil {
+		t.Fatal(err)
 	}
 
-	signer, err := newIAMSigner(ctx, conf)
+	signer.httpClient.Client = &http.Client{
+		Transport: &mockHTTPResponse{
+			Err: errors.New("transport error"),
+		},
+	}
+
+	_, err = signer.Sign(context.Background(), []byte("input"))
+	if err == nil {
+		t.Error("Sign() = nil; want = error")
+	}
+}
+
+func TestIAMSignerWithMetadataService(t *testing.T) {
+	ctx := context.Background()
+	signer, err := newIAMSigner(ctx, "", optsWithTokenSource...)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -240,13 +238,52 @@ func TestIAMSignerWithMetadataService(t *testing.T) {
 	}
 }
 
-func TestIAMSignerNoMetadataService(t *testing.T) {
+func TestMetadataServiceEmptyResponse(t *testing.T) {
 	ctx := context.Background()
-	conf := &internal.AuthConfig{
-		Opts: optsWithTokenSource,
+	signer, err := newIAMSigner(ctx, "", optsWithTokenSource...)
+	if err != nil {
+		t.Fatal(err)
 	}
 
-	signer, err := newIAMSigner(ctx, conf)
+	emptyResponse := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer r.Body.Close()
+		w.Header().Set("Content-Type", "application/text")
+		w.Write([]byte(""))
+	})
+	metadata := httptest.NewServer(emptyResponse)
+	defer metadata.Close()
+	signer.metadataHost = metadata.URL
+
+	email, err := signer.Email(ctx)
+	if email != "" || err == nil {
+		t.Errorf("Email() = (%q, %v); want = (%q, nil)", email, err, "")
+	}
+}
+
+func TestMetadataServiceError(t *testing.T) {
+	ctx := context.Background()
+	signer, err := newIAMSigner(ctx, "", optsWithTokenSource...)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	errorResponse := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer r.Body.Close()
+		w.WriteHeader(http.StatusInternalServerError)
+	})
+	metadata := httptest.NewServer(errorResponse)
+	defer metadata.Close()
+	signer.metadataHost = metadata.URL
+
+	email, err := signer.Email(ctx)
+	if email != "" || err == nil {
+		t.Errorf("Email() = (%q, %v); want = (%q, nil)", email, err, "")
+	}
+}
+
+func TestIAMSignerNoMetadataService(t *testing.T) {
+	ctx := context.Background()
+	signer, err := newIAMSigner(ctx, "", optsWithTokenSource...)
 	if err != nil {
 		t.Fatal(err)
 	}

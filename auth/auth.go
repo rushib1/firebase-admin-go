@@ -18,24 +18,11 @@ package auth
 
 import (
 	"context"
-	"errors"
-	"fmt"
-	"strings"
 
 	"firebase.google.com/go/internal"
 	"google.golang.org/api/identitytoolkit/v3"
 	"google.golang.org/api/transport"
 )
-
-const (
-	firebaseAudience = "https://identitytoolkit.googleapis.com/google.identity.identitytoolkit.v1.IdentityToolkit"
-	oneHourInSeconds = 3600
-)
-
-var reservedClaims = []string{
-	"acr", "amr", "at_hash", "aud", "auth_time", "azp", "cnf", "c_hash",
-	"exp", "firebase", "iat", "iss", "jti", "nbf", "nonce", "sub",
-}
 
 // Client is the interface for the Firebase auth service.
 //
@@ -44,9 +31,8 @@ var reservedClaims = []string{
 type Client struct {
 	is              *identitytoolkit.Service
 	idTokenVerifier *tokenVerifier
-	signer          cryptoSigner
+	tokenGenerator  *tokenGenerator
 	version         string
-	clock           internal.Clock
 }
 
 // NewClient creates a new instance of the Firebase Auth Client.
@@ -54,36 +40,6 @@ type Client struct {
 // This function can only be invoked from within the SDK. Client applications should access the
 // Auth service through firebase.App.
 func NewClient(ctx context.Context, conf *internal.AuthConfig) (*Client, error) {
-	var (
-		signer cryptoSigner
-		err    error
-	)
-	// Initialize a signer by following the go/firebase-admin-sign protocol.
-	if conf.Creds != nil && len(conf.Creds.JSON) > 0 {
-		// If the SDK was initialized with a service account, use it to sign bytes.
-		signer, err = signerFromCreds(conf.Creds.JSON)
-		if err != nil && err != errNotAServiceAcct {
-			return nil, err
-		}
-	}
-	if signer == nil {
-		if conf.ServiceAccountID != "" {
-			// If the SDK was initialized with a service account email, use it with the IAM service
-			// to sign bytes.
-			signer, err = newIAMSigner(ctx, conf)
-			if err != nil {
-				return nil, err
-			}
-		} else {
-			// Use GAE signing capabilities if available. Otherwise, obtain a service account email
-			// from the local Metadata service, and fallback to the IAM service.
-			signer, err = newCryptoSigner(ctx, conf)
-			if err != nil {
-				return nil, err
-			}
-		}
-	}
-
 	hc, _, err := transport.NewHTTPClient(ctx, conf.Opts...)
 	if err != nil {
 		return nil, err
@@ -94,16 +50,21 @@ func NewClient(ctx context.Context, conf *internal.AuthConfig) (*Client, error) 
 		return nil, err
 	}
 
+	tokenGenerator, err := newTokenGenerator(ctx, conf)
+	if err != nil {
+		return nil, err
+	}
+
 	idTokenVerifier, err := newIDTokenVerifier(ctx, conf.ProjectID)
 	if err != nil {
 		return nil, err
 	}
+
 	return &Client{
 		is:              is,
 		idTokenVerifier: idTokenVerifier,
-		signer:          signer,
+		tokenGenerator:  tokenGenerator,
 		version:         "Go/Admin/" + conf.Version,
-		clock:           internal.SystemClock,
 	}, nil
 }
 
@@ -133,41 +94,7 @@ func (c *Client) CustomToken(ctx context.Context, uid string) (string, error) {
 // CustomTokenWithClaims is similar to CustomToken, but in addition to the user ID, it also encodes
 // all the key-value pairs in the provided map as claims in the resulting JWT.
 func (c *Client) CustomTokenWithClaims(ctx context.Context, uid string, devClaims map[string]interface{}) (string, error) {
-	iss, err := c.signer.Email(ctx)
-	if err != nil {
-		return "", err
-	}
-
-	if len(uid) == 0 || len(uid) > 128 {
-		return "", errors.New("uid must be non-empty, and not longer than 128 characters")
-	}
-
-	var disallowed []string
-	for _, k := range reservedClaims {
-		if _, contains := devClaims[k]; contains {
-			disallowed = append(disallowed, k)
-		}
-	}
-	if len(disallowed) == 1 {
-		return "", fmt.Errorf("developer claim %q is reserved and cannot be specified", disallowed[0])
-	} else if len(disallowed) > 1 {
-		return "", fmt.Errorf("developer claims %q are reserved and cannot be specified", strings.Join(disallowed, ", "))
-	}
-
-	now := c.clock.Now().Unix()
-	info := &jwtInfo{
-		header: jwtHeader{Algorithm: "RS256", Type: "JWT"},
-		payload: &customToken{
-			Iss:    iss,
-			Sub:    iss,
-			Aud:    firebaseAudience,
-			UID:    uid,
-			Iat:    now,
-			Exp:    now + oneHourInSeconds,
-			Claims: devClaims,
-		},
-	}
-	return info.Token(ctx, c.signer)
+	return c.tokenGenerator.Token(ctx, uid, devClaims)
 }
 
 // Token represents a decoded Firebase ID token.

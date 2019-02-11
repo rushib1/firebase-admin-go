@@ -23,5 +23,5 @@ import (
 )
 
 func newCryptoSigner(ctx context.Context, conf *internal.AuthConfig) (cryptoSigner, error) {
-	return newIAMSigner(ctx, conf)
+	return newIAMSigner(ctx, conf.ServiceAccountID, conf.Opts...)
 }

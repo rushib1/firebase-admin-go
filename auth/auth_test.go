@@ -32,10 +32,17 @@ import (
 	"google.golang.org/api/transport"
 )
 
+const (
+	testProjectID     = "mock-project-id"
+	testServiceAcctID = "explicit-service-account"
+	testVersion       = "test-version"
+	reportedVersion   = "Go/Admin/test-version"
+)
+
 var (
 	testGetUserResponse []byte
 	testIDToken         string
-	testSigner          cryptoSigner
+	testTokenGenerator  *tokenGenerator
 	testIDTokenVerifier *tokenVerifier
 
 	optsWithServiceAcct = []option.ClientOption{
@@ -46,13 +53,12 @@ var (
 			AccessToken: "test.token",
 		}),
 	}
-	testClock     = &internal.MockClock{Timestamp: time.Now()}
-	testProjectID = "mock-project-id"
+	testClock = &internal.MockClock{Timestamp: time.Now()}
 )
 
 func TestMain(m *testing.M) {
 	var err error
-	testSigner, err = signerForTests(context.Background())
+	testTokenGenerator, err = tokenGeneratorForTests(context.Background())
 	if err != nil {
 		log.Fatalln(err)
 	}
@@ -80,78 +86,62 @@ func TestNewClientWithServiceAccountCredentials(t *testing.T) {
 		Creds:     creds,
 		Opts:      optsWithServiceAcct,
 		ProjectID: creds.ProjectID,
-		Version:   "test-version",
+		Version:   testVersion,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	if _, ok := client.signer.(*serviceAccountSigner); !ok {
-		t.Errorf("NewClient().signer = %#v; want = serviceAccountSigner", client.signer)
+	if err := checkServiceAcctTokenGenerator(client.tokenGenerator); err != nil {
+		t.Errorf("NewClient().tokenGenerator = %v; want = nil", err)
 	}
 	if err := checkIDTokenVerifier(client.idTokenVerifier, creds.ProjectID); err != nil {
 		t.Errorf("NewClient().idTokenVerifier = %v; want = nil", err)
 	}
-	if client.clock != internal.SystemClock {
-		t.Errorf("NewClient().clock = %v; want = SystemClock", client.clock)
-	}
-	wantVersion := "Go/Admin/test-version"
-	if client.version != wantVersion {
-		t.Errorf("NewClient().version = %q; want = %q", client.version, wantVersion)
+	if client.version != reportedVersion {
+		t.Errorf("NewClient().version = %q; want = %q", client.version, reportedVersion)
 	}
 }
 
 func TestNewClientWithoutCredentials(t *testing.T) {
-	conf := &internal.AuthConfig{
+	client, err := NewClient(context.Background(), &internal.AuthConfig{
+		Creds:   nil,
 		Opts:    optsWithTokenSource,
-		Version: "test-version",
-	}
-	client, err := NewClient(context.Background(), conf)
+		Version: testVersion,
+	})
 	if err != nil {
-		t.Errorf("NewClient() = (%v,%v); want = (nil, error)", client, err)
+		t.Fatalf("NewClient() = (%v,%v); want = (nil, error)", client, err)
 	}
-	if _, ok := client.signer.(*iamSigner); !ok {
-		t.Errorf("NewClient().signer = %#v; want = iamSigner", client.signer)
+
+	if err := checkIAMTokenGenerator(client.tokenGenerator, ""); err != nil {
+		t.Errorf("NewClient().tokenGenerator = %v; want = nil", err)
 	}
 	if err := checkIDTokenVerifier(client.idTokenVerifier, ""); err != nil {
 		t.Errorf("NewClient().idTokenVerifier = %v; want = nil", err)
 	}
-	if client.clock != internal.SystemClock {
-		t.Errorf("NewClient().clock = %v; want = SystemClock", client.clock)
-	}
-	wantVersion := "Go/Admin/test-version"
-	if client.version != wantVersion {
-		t.Errorf("NewClient().version = %q; want = %q", client.version, wantVersion)
+	if client.version != reportedVersion {
+		t.Errorf("NewClient().version = %q; want = %q", client.version, reportedVersion)
 	}
 }
 
 func TestNewClientWithServiceAccountID(t *testing.T) {
-	conf := &internal.AuthConfig{
+	client, err := NewClient(context.Background(), &internal.AuthConfig{
 		Opts:             optsWithTokenSource,
-		ServiceAccountID: "explicit-service-account",
-		Version:          "test-version",
-	}
-	client, err := NewClient(context.Background(), conf)
+		ServiceAccountID: testServiceAcctID,
+		Version:          testVersion,
+	})
 	if err != nil {
-		t.Errorf("NewClient() = (%v,%v); want = (nil, error)", client, err)
+		t.Fatalf("NewClient() = (%v,%v); want = (nil, error)", client, err)
 	}
-	if _, ok := client.signer.(*iamSigner); !ok {
-		t.Errorf("NewClient().signer = %#v; want = iamSigner", client.signer)
+
+	if err := checkIAMTokenGenerator(client.tokenGenerator, testServiceAcctID); err != nil {
+		t.Errorf("NewClient().tokenGenerator = %v; want = nil", err)
 	}
 	if err := checkIDTokenVerifier(client.idTokenVerifier, ""); err != nil {
 		t.Errorf("NewClient().idTokenVerifier = %v; want = nil", err)
 	}
-	if client.clock != internal.SystemClock {
-		t.Errorf("NewClient().clock = %v; want = SystemClock", client.clock)
-	}
-	wantVersion := "Go/Admin/test-version"
-	if client.version != wantVersion {
-		t.Errorf("NewClient().version = %q; want = %q", client.version, wantVersion)
-	}
-
-	email, err := client.signer.Email(context.Background())
-	if email != conf.ServiceAccountID || err != nil {
-		t.Errorf("Email() = (%q, %v); want = (%q, nil)", email, err, conf.ServiceAccountID)
+	if client.version != reportedVersion {
+		t.Errorf("NewClient().version = %q; want = %q", client.version, reportedVersion)
 	}
 }
 
@@ -162,26 +152,22 @@ func TestNewClientWithUserCredentials(t *testing.T) {
 			"client_secret": "test-secret"
 		}`),
 	}
-	conf := &internal.AuthConfig{
+	client, err := NewClient(context.Background(), &internal.AuthConfig{
 		Creds:   creds,
-		Version: "test-version",
-	}
-	client, err := NewClient(context.Background(), conf)
+		Version: testVersion,
+	})
 	if err != nil {
-		t.Errorf("NewClient() = (%v,%v); want = (nil, error)", client, err)
+		t.Fatalf("NewClient() = (%v,%v); want = (nil, error)", client, err)
 	}
-	if _, ok := client.signer.(*iamSigner); !ok {
-		t.Errorf("NewClient().signer = %#v; want = iamSigner", client.signer)
+
+	if err := checkIAMTokenGenerator(client.tokenGenerator, ""); err != nil {
+		t.Errorf("NewClient().tokenGenerator = %v; want = nil", err)
 	}
 	if err := checkIDTokenVerifier(client.idTokenVerifier, ""); err != nil {
 		t.Errorf("NewClient().idTokenVerifier = %v; want = nil", err)
 	}
-	if client.clock != internal.SystemClock {
-		t.Errorf("NewClient().clock = %v; want = SystemClock", client.clock)
-	}
-	wantVersion := "Go/Admin/test-version"
-	if client.version != wantVersion {
-		t.Errorf("NewClient().version = %q; want = %q", client.version, wantVersion)
+	if client.version != reportedVersion {
+		t.Errorf("NewClient().version = %q; want = %q", client.version, reportedVersion)
 	}
 }
 
@@ -213,8 +199,7 @@ func TestNewClientWithInvalidPrivateKey(t *testing.T) {
 
 func TestCustomToken(t *testing.T) {
 	client := &Client{
-		signer: testSigner,
-		clock:  testClock,
+		tokenGenerator: testTokenGenerator,
 	}
 	token, err := client.CustomToken(context.Background(), "user1")
 	if err != nil {
@@ -225,8 +210,7 @@ func TestCustomToken(t *testing.T) {
 
 func TestCustomTokenWithClaims(t *testing.T) {
 	client := &Client{
-		signer: testSigner,
-		clock:  testClock,
+		tokenGenerator: testTokenGenerator,
 	}
 	claims := map[string]interface{}{
 		"foo":     "bar",
@@ -242,8 +226,7 @@ func TestCustomTokenWithClaims(t *testing.T) {
 
 func TestCustomTokenWithNilClaims(t *testing.T) {
 	client := &Client{
-		signer: testSigner,
-		clock:  testClock,
+		tokenGenerator: testTokenGenerator,
 	}
 	token, err := client.CustomTokenWithClaims(context.Background(), "user1", nil)
 	if err != nil {
@@ -265,8 +248,7 @@ func TestCustomTokenError(t *testing.T) {
 	}
 
 	client := &Client{
-		signer: testSigner,
-		clock:  testClock,
+		tokenGenerator: testTokenGenerator,
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -471,7 +453,7 @@ func TestVerifyIDTokenInvalidAlgorithm(t *testing.T) {
 		},
 		payload: payload,
 	}
-	token, err := info.Token(context.Background(), testSigner)
+	token, err := info.Token(context.Background(), testTokenGenerator.signer)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -502,8 +484,7 @@ func TestVerifyIDTokenWithNoProjectID(t *testing.T) {
 func TestCustomTokenVerification(t *testing.T) {
 	client := &Client{
 		idTokenVerifier: testIDTokenVerifier,
-		signer:          testSigner,
-		clock:           testClock,
+		tokenGenerator:  testTokenGenerator,
 	}
 	token, err := client.CustomToken(context.Background(), "user1")
 	if err != nil {
@@ -592,13 +573,33 @@ func TestVerifyIDTokenAndCheckRevokedError(t *testing.T) {
 	}
 }
 
-func signerForTests(ctx context.Context) (cryptoSigner, error) {
+func TestVerifyIDTokenAndCheckRevokedUserNotFound(t *testing.T) {
+	s := echoServer([]byte(`{"users": []}`), t)
+	defer s.Close()
+	revokedToken := getIDToken(mockIDTokenPayload{"uid": "uid", "iat": 1970})
+	s.Client.idTokenVerifier = testIDTokenVerifier
+
+	p, err := s.Client.VerifyIDTokenAndCheckRevoked(context.Background(), revokedToken)
+	if p != nil || err == nil || !IsUserNotFound(err) {
+		t.Errorf("VerifyIDTokenAndCheckRevoked(ctx, token) =(%v, %v); want = (%v, user-not-found)",
+			p, err, nil)
+	}
+}
+
+func tokenGeneratorForTests(ctx context.Context) (*tokenGenerator, error) {
 	creds, err := transport.Creds(ctx, optsWithServiceAcct...)
 	if err != nil {
 		return nil, err
 	}
 
-	return signerFromCreds(creds.JSON)
+	signer, err := newServiceAccountSigner(creds.JSON)
+	if err != nil {
+		return nil, err
+	}
+	return &tokenGenerator{
+		signer: signer,
+		clock:  testClock,
+	}, nil
 }
 
 func idTokenVerifierForTests(ctx context.Context) (*tokenVerifier, error) {
@@ -670,11 +671,40 @@ func getIDTokenWithKid(kid string, p mockIDTokenPayload) string {
 		},
 		payload: pCopy,
 	}
-	token, err := info.Token(context.Background(), testSigner)
+	token, err := info.Token(context.Background(), testTokenGenerator.signer)
 	if err != nil {
 		log.Fatalln(err)
 	}
 	return token
+}
+
+func checkServiceAcctTokenGenerator(tg *tokenGenerator) error {
+	if tg.clock != internal.SystemClock {
+		return fmt.Errorf("newTokenGenerator().clock = %v; want = SystemClock", tg.clock)
+	}
+	signer, ok := tg.signer.(*serviceAccountSigner)
+	if !ok {
+		return fmt.Errorf("newTokenGenerator().signer = %#v; want = serviceAccountSigner", tg.signer)
+	}
+	const wantEmail = "mock-email@mock-project.iam.gserviceaccount.com"
+	if signer.clientEmail != wantEmail {
+		return fmt.Errorf("signer.serviceAcct = %q; want = %q", signer.clientEmail, wantEmail)
+	}
+	return nil
+}
+
+func checkIAMTokenGenerator(tg *tokenGenerator, wantServiceAcct string) error {
+	if tg.clock != internal.SystemClock {
+		return fmt.Errorf("newTokenGenerator().clock = %v; want = SystemClock", tg.clock)
+	}
+	signer, ok := tg.signer.(*iamSigner)
+	if !ok {
+		return fmt.Errorf("newTokenGenerator().signer = %#v; want = iamSigner", tg.signer)
+	}
+	if signer.serviceAcct != wantServiceAcct {
+		return fmt.Errorf("signer.serviceAcct = %q; want = %q", signer.serviceAcct, wantServiceAcct)
+	}
+	return nil
 }
 
 func checkIDTokenVerifier(tv *tokenVerifier, projectID string) error {
@@ -706,7 +736,7 @@ func verifyCustomToken(ctx context.Context, token string, expected map[string]in
 		t.Fatal(err)
 	}
 
-	email, err := testSigner.Email(ctx)
+	email, err := testTokenGenerator.signer.Email(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
