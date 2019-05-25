@@ -24,12 +24,12 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	"firebase.google.com/go/internal"
-	"google.golang.org/api/identitytoolkit/v3"
 	"google.golang.org/api/iterator"
 )
 
@@ -180,7 +180,7 @@ func TestListUsers(t *testing.T) {
 		{UserRecord: testUser, PasswordHash: "passwordhash3", PasswordSalt: "salt3"},
 	}
 
-	testIterator := func(iter *UserIterator, token string, req map[string]interface{}) {
+	testIterator := func(iter *UserIterator, token string, req string) {
 		count := 0
 		for i := 0; i < len(want); i++ {
 			user, err := iter.Next()
@@ -208,20 +208,20 @@ func TestListUsers(t *testing.T) {
 			t.Errorf("Users(%q) = %v, want = %v", token, err, iterator.Done)
 		}
 
-		b, err := json.Marshal(req)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if string(s.Rbody) != string(b) {
-			t.Errorf("Users(%q) = %v, want = %v", token, string(s.Rbody), string(b))
+		// Check the query string of the last HTTP request made.
+		gotReq := s.Req[len(s.Req)-1].URL.Query().Encode()
+		if gotReq != req {
+			t.Errorf("Users(%q) = %q, want = %v", token, gotReq, req)
 		}
 	}
 	testIterator(
 		s.Client.Users(context.Background(), ""),
-		"", map[string]interface{}{"maxResults": 1000})
+		"",
+		"maxResults=1000")
 	testIterator(
 		s.Client.Users(context.Background(), "pageToken"),
-		"pageToken", map[string]interface{}{"maxResults": 1000, "nextPageToken": "pageToken"})
+		"pageToken",
+		"maxResults=1000&nextPageToken=pageToken")
 }
 
 func TestInvalidCreateUser(t *testing.T) {
@@ -350,14 +350,14 @@ func TestCreateUser(t *testing.T) {
 	for _, tc := range cases {
 		uid, err := s.Client.createUser(context.Background(), tc.params)
 		if uid != "expectedUserID" || err != nil {
-			t.Errorf("createUser(%v) = (%q, %v); want = (%q, nil)", tc.params, uid, err, "expectedUserID")
+			t.Errorf("createUser(%#v) = (%q, %v); want = (%q, nil)", tc.params, uid, err, "expectedUserID")
 		}
 		want, err := json.Marshal(tc.req)
 		if err != nil {
 			t.Fatal(err)
 		}
 		if !reflect.DeepEqual(s.Rbody, want) {
-			t.Errorf("createUser() request = %v; want = %v", string(s.Rbody), string(want))
+			t.Errorf("createUser(%#v) request = %v; want = %v", tc.params, string(s.Rbody), string(want))
 		}
 	}
 }
@@ -518,6 +518,7 @@ func TestUpdateUser(t *testing.T) {
 		}
 	}
 }
+
 func TestRevokeRefreshTokens(t *testing.T) {
 	resp := `{
 		"kind": "identitytoolkit#SetAccountInfoResponse",
@@ -531,12 +532,20 @@ func TestRevokeRefreshTokens(t *testing.T) {
 	}
 	after := time.Now().Unix()
 
-	req := &identitytoolkit.IdentitytoolkitRelyingpartySetAccountInfoRequest{}
-	if err := json.Unmarshal(s.Rbody, &req); err != nil {
-		t.Error(err)
+	var req struct {
+		ValidSince string `json:"validSince"`
 	}
-	if req.ValidSince > after || req.ValidSince < before {
-		t.Errorf("validSince = %d, expecting time between %d and %d", req.ValidSince, before, after)
+	if err := json.Unmarshal(s.Rbody, &req); err != nil {
+		t.Fatal(err)
+	}
+
+	validSince, err := strconv.ParseInt(req.ValidSince, 10, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if validSince > after || validSince < before {
+		t.Errorf("validSince = %d, expecting time between %d and %d", validSince, before, after)
 	}
 }
 
@@ -638,40 +647,40 @@ func TestSetCustomUserClaims(t *testing.T) {
 func TestUserToImport(t *testing.T) {
 	cases := []struct {
 		user *UserToImport
-		want *identitytoolkit.UserInfo
+		want map[string]interface{}
 	}{
 		{
 			user: (&UserToImport{}).UID("test"),
-			want: &identitytoolkit.UserInfo{
-				LocalId: "test",
+			want: map[string]interface{}{
+				"localId": "test",
 			},
 		},
 		{
 			user: (&UserToImport{}).UID("test").DisplayName("name"),
-			want: &identitytoolkit.UserInfo{
-				LocalId:     "test",
-				DisplayName: "name",
+			want: map[string]interface{}{
+				"localId":     "test",
+				"displayName": "name",
 			},
 		},
 		{
 			user: (&UserToImport{}).UID("test").Email("test@example.com"),
-			want: &identitytoolkit.UserInfo{
-				LocalId: "test",
-				Email:   "test@example.com",
+			want: map[string]interface{}{
+				"localId": "test",
+				"email":   "test@example.com",
 			},
 		},
 		{
 			user: (&UserToImport{}).UID("test").PhotoURL("https://test.com/user.png"),
-			want: &identitytoolkit.UserInfo{
-				LocalId:  "test",
-				PhotoUrl: "https://test.com/user.png",
+			want: map[string]interface{}{
+				"localId":  "test",
+				"photoUrl": "https://test.com/user.png",
 			},
 		},
 		{
 			user: (&UserToImport{}).UID("test").PhoneNumber("+1234567890"),
-			want: &identitytoolkit.UserInfo{
-				LocalId:     "test",
-				PhoneNumber: "+1234567890",
+			want: map[string]interface{}{
+				"localId":     "test",
+				"phoneNumber": "+1234567890",
 			},
 		},
 		{
@@ -679,37 +688,37 @@ func TestUserToImport(t *testing.T) {
 				CreationTimestamp:  int64(100),
 				LastLogInTimestamp: int64(150),
 			}),
-			want: &identitytoolkit.UserInfo{
-				LocalId:     "test",
-				CreatedAt:   int64(100),
-				LastLoginAt: int64(150),
+			want: map[string]interface{}{
+				"localId":     "test",
+				"createdAt":   int64(100),
+				"lastLoginAt": int64(150),
 			},
 		},
 		{
 			user: (&UserToImport{}).UID("test").PasswordHash([]byte("password")),
-			want: &identitytoolkit.UserInfo{
-				LocalId:      "test",
-				PasswordHash: base64.RawURLEncoding.EncodeToString([]byte("password")),
+			want: map[string]interface{}{
+				"localId":      "test",
+				"passwordHash": base64.RawURLEncoding.EncodeToString([]byte("password")),
 			},
 		},
 		{
 			user: (&UserToImport{}).UID("test").PasswordSalt([]byte("nacl")),
-			want: &identitytoolkit.UserInfo{
-				LocalId: "test",
-				Salt:    base64.RawURLEncoding.EncodeToString([]byte("nacl")),
+			want: map[string]interface{}{
+				"localId": "test",
+				"salt":    base64.RawURLEncoding.EncodeToString([]byte("nacl")),
 			},
 		},
 		{
 			user: (&UserToImport{}).UID("test").CustomClaims(map[string]interface{}{"admin": true}),
-			want: &identitytoolkit.UserInfo{
-				LocalId:          "test",
-				CustomAttributes: `{"admin":true}`,
+			want: map[string]interface{}{
+				"localId":          "test",
+				"customAttributes": `{"admin":true}`,
 			},
 		},
 		{
 			user: (&UserToImport{}).UID("test").CustomClaims(map[string]interface{}{}),
-			want: &identitytoolkit.UserInfo{
-				LocalId: "test",
+			want: map[string]interface{}{
+				"localId": "test",
 			},
 		},
 		{
@@ -719,44 +728,42 @@ func TestUserToImport(t *testing.T) {
 					UID:        "test",
 				},
 			}),
-			want: &identitytoolkit.UserInfo{
-				LocalId: "test",
-				ProviderUserInfo: []*identitytoolkit.UserInfoProviderUserInfo{
+			want: map[string]interface{}{
+				"localId": "test",
+				"providerUserInfo": []*UserProvider{
 					{
-						ProviderId: "google.com",
-						RawId:      "test",
+						ProviderID: "google.com",
+						UID:        "test",
 					},
 				},
 			},
 		},
 		{
 			user: (&UserToImport{}).UID("test").EmailVerified(true),
-			want: &identitytoolkit.UserInfo{
-				LocalId:       "test",
-				EmailVerified: true,
+			want: map[string]interface{}{
+				"localId":       "test",
+				"emailVerified": true,
 			},
 		},
 		{
 			user: (&UserToImport{}).UID("test").EmailVerified(false),
-			want: &identitytoolkit.UserInfo{
-				LocalId:         "test",
-				EmailVerified:   false,
-				ForceSendFields: []string{"EmailVerified"},
+			want: map[string]interface{}{
+				"localId":       "test",
+				"emailVerified": false,
 			},
 		},
 		{
 			user: (&UserToImport{}).UID("test").Disabled(true),
-			want: &identitytoolkit.UserInfo{
-				LocalId:  "test",
-				Disabled: true,
+			want: map[string]interface{}{
+				"localId":  "test",
+				"disabled": true,
 			},
 		},
 		{
 			user: (&UserToImport{}).UID("test").Disabled(false),
-			want: &identitytoolkit.UserInfo{
-				LocalId:         "test",
-				Disabled:        false,
-				ForceSendFields: []string{"Disabled"},
+			want: map[string]interface{}{
+				"localId":  "test",
+				"disabled": false,
 			},
 		},
 	}
@@ -906,13 +913,13 @@ type mockHash struct {
 	rounds, memoryCost int64
 }
 
-func (h mockHash) Config() (*internal.HashConfig, error) {
-	return &internal.HashConfig{
-		HashAlgorithm: "MOCKHASH",
-		SignerKey:     h.key,
-		SaltSeparator: h.saltSep,
-		Rounds:        h.rounds,
-		MemoryCost:    h.memoryCost,
+func (h mockHash) Config() (internal.HashConfig, error) {
+	return internal.HashConfig{
+		"hashAlgorithm": "MOCKHASH",
+		"signerKey":     h.key,
+		"saltSeparator": h.saltSep,
+		"rounds":        h.rounds,
+		"memoryCost":    h.memoryCost,
 	}, nil
 }
 
@@ -988,31 +995,31 @@ func TestInvalidDeleteUser(t *testing.T) {
 }
 
 func TestMakeExportedUser(t *testing.T) {
-	rur := &identitytoolkit.UserInfo{
-		LocalId:          "testuser",
-		Email:            "testuser@example.com",
-		PhoneNumber:      "+1234567890",
-		EmailVerified:    true,
-		DisplayName:      "Test User",
-		Salt:             "salt",
-		PhotoUrl:         "http://www.example.com/testuser/photo.png",
-		PasswordHash:     "passwordhash",
-		ValidSince:       1494364393,
-		Disabled:         false,
-		CreatedAt:        1234567890000,
-		LastLoginAt:      1233211232000,
-		CustomAttributes: `{"admin": true, "package": "gold"}`,
-		ProviderUserInfo: []*identitytoolkit.UserInfoProviderUserInfo{
+	rur := &userQueryResponse{
+		UID:                "testuser",
+		Email:              "testuser@example.com",
+		PhoneNumber:        "+1234567890",
+		EmailVerified:      true,
+		DisplayName:        "Test User",
+		PasswordSalt:       "salt",
+		PhotoURL:           "http://www.example.com/testuser/photo.png",
+		PasswordHash:       "passwordhash",
+		ValidSinceSeconds:  1494364393,
+		Disabled:           false,
+		CreationTimestamp:  1234567890000,
+		LastLogInTimestamp: 1233211232000,
+		CustomAttributes:   `{"admin": true, "package": "gold"}`,
+		ProviderUserInfo: []*UserInfo{
 			{
-				ProviderId:  "password",
+				ProviderID:  "password",
 				DisplayName: "Test User",
-				PhotoUrl:    "http://www.example.com/testuser/photo.png",
+				PhotoURL:    "http://www.example.com/testuser/photo.png",
 				Email:       "testuser@example.com",
-				RawId:       "testuid",
+				UID:         "testuid",
 			}, {
-				ProviderId:  "phone",
+				ProviderID:  "phone",
 				PhoneNumber: "+1234567890",
-				RawId:       "testuid",
+				UID:         "testuid",
 			}},
 	}
 
@@ -1021,7 +1028,7 @@ func TestMakeExportedUser(t *testing.T) {
 		PasswordHash: "passwordhash",
 		PasswordSalt: "salt",
 	}
-	exported, err := makeExportedUser(rur)
+	exported, err := rur.makeExportedUserRecord()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1143,6 +1150,7 @@ func TestSessionCookieLongExpiresIn(t *testing.T) {
 func TestHTTPError(t *testing.T) {
 	s := echoServer([]byte(`{"error":"test"}`), t)
 	defer s.Close()
+	s.Client.httpClient.RetryConfig = nil
 	s.Status = http.StatusInternalServerError
 
 	u, err := s.Client.GetUser(context.Background(), "some uid")
@@ -1150,7 +1158,7 @@ func TestHTTPError(t *testing.T) {
 		t.Fatalf("GetUser() = (%v, %v); want = (nil, error)", u, err)
 	}
 
-	want := `googleapi: got HTTP response code 500 with body: {"error":"test"}`
+	want := `http error status: 500; body: {"error":"test"}`
 	if err.Error() != want || !IsUnknown(err) {
 		t.Errorf("GetUser() = %v; want = %q", err, want)
 	}
@@ -1168,6 +1176,7 @@ func TestHTTPErrorWithCode(t *testing.T) {
 	}
 	s := echoServer(nil, t)
 	defer s.Close()
+	s.Client.httpClient.RetryConfig = nil
 	s.Status = http.StatusInternalServerError
 
 	for code, check := range errorCodes {
@@ -1177,7 +1186,7 @@ func TestHTTPErrorWithCode(t *testing.T) {
 			t.Fatalf("GetUser() = (%v, %v); want = (nil, error)", u, err)
 		}
 
-		want := fmt.Sprintf("googleapi: Error 500: %s", code)
+		want := fmt.Sprintf(`http error status: 500; body: {"error":{"message":"%s"}}`, code)
 		if err.Error() != want || !check(err) {
 			t.Errorf("GetUser() = %v; want = %q", err, want)
 		}
@@ -1261,7 +1270,6 @@ func echoServer(resp interface{}, t *testing.T) *mockAuthServer {
 	if err != nil {
 		t.Fatal(err)
 	}
-	authClient.is.BasePath = s.Srv.URL + "/"
 	authClient.baseURL = s.Srv.URL
 	s.Client = authClient
 	return &s
