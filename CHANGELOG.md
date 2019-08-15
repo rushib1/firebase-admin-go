@@ -1,5 +1,19 @@
 # Unreleased
 
+# v3.8.1
+
+- [fixed] Fixed a test case that was failing in environments without
+  Application Default Credentials support.
+
+# v3.8.0
+
+- [added] Implemented `auth.EmailVerificationLink()` function for
+  generating email verification action links.
+- [added] Implemented `auth.PasswordResetLink()` function for
+  generating password reset action links.
+- [added] Implemented `auth.EmailSignInLink()` function for generating
+  email sign in action links.
+
 # v3.7.0
 
 - [added] Implemented `auth.SessionCookie()` function for creating
